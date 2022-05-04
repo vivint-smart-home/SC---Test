@@ -1,0 +1,333 @@
+CREATE OR REPLACE TABLE TEMP.InventoryMovementStage_601 AS 
+SELECT VBAP.Sales_Document,
+	VBAK.BNAME as Work_Order_Name,
+	VBAP.aufnr,
+	wo.id AS Work_Order_ID_BK,
+	ROW_NUMBER() OVER (PARTITION BY vbap.aufnr ORDER BY VBAK.BNAME DESC) AS rn
+FROM (select distinct AUFNR, VBELN as Sales_Document from SOURCE_SAP_INTERNAL.VBAP) as VBAP
+	left join SOURCE_SAP_INTERNAL.VBAK on VBAK.VBELN = VBAP.Sales_Document
+	LEFT JOIN prod.SOURCE_SFDC_PROD_INTERNAL.WORK_ORDER__C wo ON wo.NAME = vbak.bname;
+
+CREATE OR REPLACE TABLE staging.SAP_ShipToCustomer AS 
+SELECT
+	matdoc.mblnr AS MaterialDoc,
+	matdoc.zeile as MaterialDocItem,
+	ifnull(lips.DeployedRecordID, matdoc.sgtxt) as DeployedRecordID,
+	matdoc.vbeln_im AS Delivery, 
+	matdoc.vbelp_im as DeliveryItem,
+	bwart as MovementType, werks as Plant, LGORT_SID as StorageLocation,
+	lips.Delivery_Deleted
+FROM SOURCE_SAP_INTERNAL.MATDOC 
+	inner JOIN
+		(SELECT lips.vbeln, lips.posnr, lips.WrhsSalesOrder, vbkd.bstkd_e as DeployedRecordID, vbkd.bstkd AS WorkOrderID, Delivery_Deleted
+		FROM (	SELECT lips.vbeln, lips.posnr, lips.vgbel AS WrhsSalesOrder, 0 AS Delivery_Deleted, lips.vgpos FROM SOURCE_SAP_INTERNAL.lips WHERE lips.mandt = 300
+					UNION
+				SELECT del.vbeln, del.posnr, del.vgbel, 1 AS Delivery_Deleted, del.vgpos FROM STAGING.SAP_LIPS_DELETED del WHERE del.mandt = 300	) lips
+			INNER JOIN prod.SOURCE_SAP_INTERNAL.vbkd ON vbkd.vbeln = lips.WrhsSalesOrder AND vbkd.posnr = lips.vgpos and vbkd.mandt = 300
+		) lips ON lips.vbeln = matdoc.vbeln_im AND lips.posnr = matdoc.vbelp_im
+WHERE mandt = 300 AND LBBSA_SID <> 06  and bwart not in ('107', '109')
+
+CREATE OR REPLACE TABLE staging.SAP_Reversals AS 
+WITH base as
+	(SELECT
+		'SLOC' || r.WERKS || r.LGORT_SID AS Reversal_Full_Storage_Location,
+		r.WERKS AS Reversal_Plant,
+		r.LGORT_SID AS Reversal_Storage_Location,
+		r.bwart AS Reversal_Movement_Type,
+		to_date(r.budat) AS Reversal_Posting_Date,
+		to_date(r.CPUDT) AS Reversal_TRANSACTION_Date,
+		r.USNAM AS Reversal_Username,
+		r.GRANT_NBR AS Reversal_Tech_Genie_Login,
+		SUBSTRING(r.CPUTM, 1, 2) || ':' || SUBSTRING(r.CPUTM, 3, 2) || ':' || SUBSTRING(r.CPUTM, 5,2) AS Reversal_Transaction_Time,
+		to_date(r.CHANGEDON) AS Reversal_Modified_Date,
+		r.MBLNR AS Reversal_Material_Document,
+		r.ZEILE AS Reversal_Material_Document_Item,
+		r.MATBF AS Reversal_Stock_Material,
+		CAST(r.STOCK_QTY AS INT) AS Reversal_Inventory_Quantity,
+		r.sgtxt AS Reversal_Inventory_Movement_Text,
+		o.Initial_Full_Storage_Location,
+		o.Initial_Plant,
+		o.Initial_Storage_Location,
+		o.Initial_Movement_Type,
+		o.Initial_Posting_Date,
+		o.Initial_TRANSACTION_Date,
+		o.Initial_Username,
+		o.Initial_Tech_Genie_Login,
+		o.Initial_Transaction_Time,
+		o.Initial_Modified_Date,
+		o.Initial_Material_Document,
+		o.Initial_Material_Document_Item,
+		o.Initial_Stock_Material,
+		o.Initial_Inventory_Quantity,
+		o.Initial_Inventory_Movement_Text,
+		ROW_NUMBER() OVER (PARTITION BY MBLNR, ZEILE ORDER BY RECORD_TYPE) AS RN
+	FROM SOURCE_SAP_INTERNAL.matdoc r
+		INNER JOIN 
+			(SELECT 'SLOC' || WERKS || LGORT_SID AS Initial_Full_Storage_Location,
+				WERKS AS Initial_Plant,
+				LGORT_SID AS Initial_Storage_Location,
+				bwart AS Initial_Movement_Type,
+				to_date(budat) AS Initial_Posting_Date,
+				to_date(CPUDT) AS Initial_TRANSACTION_Date,
+				USNAM AS Initial_Username,
+				GRANT_NBR AS Initial_Tech_Genie_Login,
+				SUBSTRING(CPUTM, 1, 2) || ':' || SUBSTRING(CPUTM, 3, 2) || ':' || SUBSTRING(CPUTM, 5,2) AS Initial_Transaction_Time,
+				to_date(CHANGEDON) AS Initial_Modified_Date,
+				MBLNR AS Initial_Material_Document,
+				ZEILE AS Initial_Material_Document_Item,
+				MATBF AS Initial_Stock_Material,
+				CAST(STOCK_QTY AS INT) AS Initial_Inventory_Quantity,
+				sgtxt AS Initial_Inventory_Movement_Text,
+				ROW_NUMBER() OVER (PARTITION BY MBLNR, ZEILE ORDER BY RECORD_TYPE) AS RN
+			FROM SOURCE_SAP_INTERNAL.matdoc
+			WHERE mandt = 300  AND LBBSA_SID <> 06) o ON o.Initial_Material_Document = r.SMBLN AND o.Initial_Material_Document_Item = r.SMBLP AND o.rn = 1
+	WHERE r.smbln IS NOT NULL AND r.mandt = 300 AND r.LBBSA_SID <> 06)
+SELECT
+		Reversal_Material_Document AS MatDoc,
+		Reversal_Material_Document_Item AS MatDocItem,
+		1 AS Is_Reversal,
+		0 AS Has_Reversal,
+		Reversal_Full_Storage_Location,
+		Reversal_Plant,
+		Reversal_Storage_Location,
+		Reversal_Movement_Type,
+		Reversal_Posting_Date,
+		Reversal_TRANSACTION_Date,
+		Reversal_Username,
+		Reversal_Tech_Genie_Login,
+		Reversal_Transaction_Time,
+		Reversal_Modified_Date,
+		Reversal_Material_Document,
+		Reversal_Material_Document_Item,
+		Reversal_Stock_Material,
+		Reversal_Inventory_Quantity,
+		Reversal_Inventory_Movement_Text,
+		Initial_Full_Storage_Location,
+		Initial_Plant,
+		Initial_Storage_Location,
+		Initial_Movement_Type,
+		Initial_Posting_Date,
+		Initial_TRANSACTION_Date,
+		Initial_Username,
+		Initial_Tech_Genie_Login,
+		Initial_Transaction_Time,
+		Initial_Modified_Date,
+		Initial_Material_Document,
+		Initial_Material_Document_Item,
+		Initial_Stock_Material,
+		Initial_Inventory_Quantity,
+		Initial_Inventory_Movement_Text
+FROM base
+WHERE base.rn = 1
+	UNION
+SELECT
+		Initial_Material_Document AS MatDoc,
+		Initial_Material_Document_Item AS MatDocItem,
+		1 AS Is_Reversal,
+		0 AS Has_Reversal,
+		Reversal_Full_Storage_Location,
+		Reversal_Plant,
+		Reversal_Storage_Location,
+		Reversal_Movement_Type,
+		Reversal_Posting_Date,
+		Reversal_TRANSACTION_Date,
+		Reversal_Username,
+		Reversal_Tech_Genie_Login,
+		Reversal_Transaction_Time,
+		Reversal_Modified_Date,
+		Reversal_Material_Document,
+		Reversal_Material_Document_Item,
+		Reversal_Stock_Material,
+		Reversal_Inventory_Quantity,
+		Reversal_Inventory_Movement_Text,
+		Initial_Full_Storage_Location,
+		Initial_Plant,
+		Initial_Storage_Location,
+		Initial_Movement_Type,
+		Initial_Posting_Date,
+		Initial_TRANSACTION_Date,
+		Initial_Username,
+		Initial_Tech_Genie_Login,
+		Initial_Transaction_Time,
+		Initial_Modified_Date,
+		Initial_Material_Document,
+		Initial_Material_Document_Item,
+		Initial_Stock_Material,
+		Initial_Inventory_Quantity,
+		Initial_Inventory_Movement_Text
+FROM base
+WHERE base.rn = 1;
+
+CREATE OR REPLACE TABLE TEMP.MatDocSentRec AS 
+SELECT 
+	'SLOC' || mt.WERKS || mt.LGORT_SID AS FullStorageLocation,
+	mt.WERKS AS Plant,
+	mt.LGORT_SID AS StorageLocation,
+	mt.BWART AS MovementType,
+	mt.MBLNR AS MaterialDocument,
+	mt.ZEILE AS MaterialDocumentLineItem,
+	mt.PARENT_ID,
+	mt.EBELN AS PurchaseOrder,
+	mt.EBELP AS PurchaseOrderLineItem,
+	mt.LE_VBELN AS Delivery,
+	mt.VBELP_IM as DeliveryItem,
+	to_date(min(budat) OVER (PARTITION BY mt.MBLNR, FullStorageLocation)) AS MinCreated,
+	sum(mt.STOCK_QTY) OVER (PARTITION BY mt.mblnr, FullStorageLocation) AS MatDocSumQty,
+	sum(mt.stock_qty)  OVER (PARTITION BY mt.mblnr, mt.ZEILE, FullStorageLocation) as SumQty,
+	count(DISTINCT mt.mblnr) OVER (PARTITION BY mt.EBELN, mt.EBELP, FullStorageLocation) AS cnt,
+	CASE WHEN mt.ELIKZ = 'X' THEN 1 ELSE 0 END AS deliverycomplete,
+	CASE WHEN right(mt.BWART, 1) IN ('2', '4') THEN 1 ELSE 0 END AS reversal,
+	CASE WHEN STOCK_QTY < 0 THEN 'R' ELSE 'S' END AS sentrec,
+	ROW_NUMBER() OVER (PARTITION BY purchaseorder, purchaseorderlineitem, sentrec ORDER BY STOCK_QTY DESC) AS rn
+FROM SOURCE_SAP_INTERNAL.MATDOC mt
+WHERE mandt = 300 AND LBBSA_SID <> 06 AND mt.BWART NOT IN ('261', '531', '551', '552')
+	and mt.EBELN >= '700000000';
+
+INSERT OVERWRITE into DIM.Inventory_Transfer_Details
+SELECT
+	mt.FullStorageLocation AS Full_Storage_Location,
+	mt.Plant,
+	mt.StorageLocation AS Storage_Location,
+	mt.MovementType AS Movement_Type,
+	mt.MaterialDocument AS Material_Document,
+	mt.MATERIALDOCUMENTLINEITEM AS MATERIAL_DOCUMENT_Line_Item,
+	mt.PurchaseOrder AS Purchase_Order,
+	mt.PURCHASEORDERLINEITEM AS Purchase_Order_Line_Item,
+	mt.MATDOCSUMQTY AS Material_Document_SUM_QUANTITY,
+	mt.SumQty AS Sum_Quantity,
+	COALESCE(mt.Delivery, mt2.Delivery, mt3.DELIVERY) AS DELIVERY_Number,
+	COALESCE(NULLIF(mt.DeliveryItem, 000000),  NULLIF(mt2.DeliveryItem, 000000), NULLIF(mt3.DELIVERYITEM, 000000)) AS Delivery_Item,
+	CASE WHEN mt.sumqty > 0 THEN 'Received' ELSE 'Sent' END AS Movement_Category,
+	CASE WHEN mt.sumqty > 0 THEN COALESCE(mt2.FullStorageLocation, 	mt3.FULLSTORAGELOCATION) 	ELSE mt.FullStorageLocation END AS Sending_Storage_Location,
+	CASE WHEN mt.sumqty > 0 THEN COALESCE(mt2.materialdocument, 	mt3.materialdocument) 		ELSE mt.materialdocument END AS Sending_Material_Document,
+	CASE WHEN mt.sumqty > 0 THEN COALESCE(mt2.MovementType, 		mt3.MovementType) 			ELSE mt.MovementType END AS Sending_Movement_Type,
+	CASE WHEN mt.sumqty > 0 THEN COALESCE(mt2.cnt, 					mt3.cnt) 					ELSE mt.cnt END AS Received_From_Document_Count,
+	CASE WHEN mt.sumqty > 0 THEN COALESCE(mt2.MinCreated, 			mt3.MinCreated) 			ELSE mt.MinCreated END AS Sending_Date,
+	CASE WHEN mt.sumqty < 0 THEN COALESCE(mt2.FullStorageLocation, 	mt3.FULLSTORAGELOCATION, po.Receiving_Plant) 	ELSE mt.FullStorageLocation END AS Receiving_Storage_Location,
+	CASE WHEN mt.sumqty < 0 THEN COALESCE(mt2.materialdocument, 	mt3.materialdocument) 		ELSE mt.materialdocument END AS Receiving_Material_Document,
+	CASE WHEN mt.sumqty < 0 THEN COALESCE(mt2.MovementType, 		mt3.MovementType) 			ELSE mt.MovementType END AS Receiving_Movement_Type,
+	CASE WHEN mt.sumqty < 0 THEN COALESCE(mt2.cnt, 					mt3.cnt) 					ELSE mt.cnt END AS Sent_To_Document_Count,
+	CASE WHEN mt.sumqty < 0 THEN COALESCE(mt2.MinCreated, 			mt3.MinCreated) 	ELSE mt.MinCreated END AS Receiving_Date,
+	CASE WHEN mt.plant = 1000 OR mt2.plant = 1000 OR mt3.PLANT = 1000
+		OR mt.plant like '5%' OR mt2.plant like '5%' OR mt3.PLANT like '5%'
+		OR mt.plant like '7%' OR mt2.plant like '7%' OR mt3.PLANT like '7%'
+		OR po.Receiving_Plant LIKE 'SLOC1000%' OR po.Receiving_Plant LIKE 'SLOC5%' OR po.Receiving_Plant LIKE 'SLOC7%' THEN 1 ELSE 0 END AS RMA_Flag,
+	max(mt.deliverycomplete) OVER (PARTITION BY mt.PURCHASEORDER) AS DeliveryComplete,
+	max(mt.reversal) OVER (PARTITION BY mt.PURCHASEORDER) AS reversal,
+	CASE WHEN COALESCE(mt2.FullStorageLocation, mt3.FULLSTORAGELOCATION) IS NULL AND po.Receiving_Plant IS NOT null
+		AND max(mt.deliverycomplete) OVER (PARTITION BY mt.PURCHASEORDER) = 0 AND max(mt.reversal) OVER (PARTITION BY mt.PURCHASEORDER) = 0 THEN 1 ELSE 0 END AS IN_TRANSIT,
+	CASE WHEN SENDING_DATE = RECEIVING_DATE THEN 1 ELSE 0 END AS Same_Day_Transfer
+FROM TEMP.MatDocSentRec mt
+	LEFT JOIN TEMP.MatDocSentRec mt2 ON mt2.MATERIALDOCUMENT = mt.MATERIALDOCUMENT AND RIGHT(mt2.PARENT_ID, 4) = mt.MATERIALDOCUMENTLINEITEM
+		AND mt2.sentrec <> mt.sentrec AND mt2.purchaseorder IS NULL AND mt2.FULLSTORAGELOCATION <> mt.FULLSTORAGELOCATION AND mt2.REVERSAL = 0
+	LEFT JOIN TEMP.MatDocSentRec mt3 ON mt3.PURCHASEORDER = mt.PURCHASEORDER AND mt3.PURCHASEORDERLINEITEM = mt.PURCHASEORDERLINEITEM
+		AND mt3.sentrec <> mt.sentrec AND mt3.rn = mt.rn AND mt3.REVERSAL = 0
+	LEFT JOIN
+		(SELECT PURCHASE_ORDER_BK, PURCHASE_ORDER_LINE_ITEM_BK, FULL_STORAGE_LOCATION AS Receiving_Plant, max(DELIVERY_INDEX) AS DELIVERY_INDEX
+		FROM DIM.PURCHASE_ORDER_DETAILS
+		GROUP BY PURCHASE_ORDER_BK, PURCHASE_ORDER_LINE_ITEM_BK, FULL_STORAGE_LOCATION
+		) po on po.purchase_order_bk = mt.PURCHASEORDER	AND po.purchase_order_line_item_bk = mt.PURCHASEORDERLINEITEM 
+--WHERE right(MOVEMENTTYPE, 1) NOT IN  ('2', '4')
+ORDER BY mt.materialdocument, mt.materialdocumentlineitem;
+
+CREATE OR REPLACE TABLE Dim.Movement_Type AS 
+	select  column1 AS Movement, column2 AS Movement_Type_Description, column3 AS Buckets
+	FROM 
+		(Values
+			('101', 'Goods Receipt', 'Transfers'),
+			('102', 'GR for PO Reversal', 'Transfers'),
+			('201', 'Goods Issued to CC', 'Transfers'),
+			('202', 'Reversal from CC', 'Transfers'),
+			('261', 'Add', 'Usage'),
+			('301', 'Tech to Tech Transfer (Different Plant)', 'Transfers'),
+			('302', 'Tech to Tech Transfer Reversal', 'Transfers'),
+			('309', 'Reclassification', 'Reclassification'),
+			('310', 'Reclass Reversal', 'Reclassification'),
+			('311', 'Tech to Tech Transfer (Same Plant)', 'Transfers'),
+			--('312', '???', '???'),
+			--('344', '???', '???'),
+			--('501', '???', '???'),
+			('531', 'Pull', 'Usage'),
+			('551', 'Found', ''),
+			('552', 'Lost', ''),
+			--('561', '???', '???'),
+			--('562', '???', '???'),
+			('601', 'Ship to Customer', 'Usage'),
+			('602', 'Ship to Customer Reversal', 'Usage'),
+			('603', 'Transfer SLOC to Plant', 'Transfers'),
+			('604', 'Reversal SLOC to Plant', 'Transfers'),
+			--('605', '???', 'Transfers'), -- Some sort of 3pl transfer
+			('641', 'Tech to Tech', 'Transfers'),
+			('642', 'Tech to Tech Transfer Reversal', 'Transfers'),
+			('701', 'Found', ''),
+			('702', 'Lost', ''),
+			('Z09', 'Reclassification', 'Reclassification'),
+			('Z10', 'Reclass Reversal', 'Reclassification')
+		)
+	
+CREATE OR REPLACE TABLE TEMP.InventoryMovementBase AS 
+SELECT
+	'SLOC' || mt.WERKS || mt.LGORT_SID AS Full_Storage_Location,
+	mt.WERKS AS Plant,
+	mt.LGORT_SID AS Storage_Location,
+	mt.bwart AS Movement_Type,
+	IFNULL(MVMT.movement_type_description, 'Other') AS movement_type_description,
+	CASE WHEN MVMT.movement_type_description in ('Lost', 'Found') AND LEFT(mt.SGTXT, 4) = 'PAID' THEN 'Lost/Found (Paid)'
+         WHEN MVMT.movement_type_description in ('Lost', 'Found') THEN 'Lost/Found (Not Paid)'
+		 WHEN MVMT.buckets <> 'Transfers' THEN MVMT.buckets
+		 WHEN msr.RMA_FLAG = 1 AND LEFT(mt.MATBF, 3) = 'RTN' THEN 'RMA'
+		 WHEN msr.RMA_FLAG = 1  THEN 'RMA (Good)'
+		 WHEN LEFT(mt.MATBF, 3) = 'RTN' --AND mt.STOCK_QTY < 0
+				AND MVMT.movement_type_description NOT IN ('Goods Issued', 'Goods Issued Reversal') THEN 'RMA (Office)'
+		WHEN MVMT.buckets IS NOT NULL THEN MVMT.Buckets
+	ELSE 'Transfers'
+	END AS Movement_Type_Group,
+	to_date(mt.budat) AS Posting_Date,
+	to_date(mt.CPUDT) AS TRANSACTION_Date,
+	mt.USNAM AS Username,
+	mt.GRANT_NBR AS Tech_Genie_Login,
+	SUBSTRING(mt.CPUTM, 1, 2) || ':' || SUBSTRING(mt.CPUTM, 3, 2) || ':' || SUBSTRING(mt.CPUTM, 5,2) AS Transaction_Time,
+	to_date(mt.CHANGEDON) AS Modified_Date,
+	mt.MBLNR AS Material_Document,
+	mt.ZEILE AS Material_Document_Item,
+	mt.EBELN AS Purchase_Order,
+	mt.EBELP AS Purchase_Order_Item,
+	mt.LE_VBELN AS Delivery_Number,
+	mt.VBELP_IM as Delivery_Number_Item,
+	CASE WHEN mt.ELIKZ = 'X' THEN 1 ELSE 0 end AS Delivery_Completed,
+	mt.LFBNR AS Reference_Document,
+	mt.AUFNR AS Accounting_Reference_Document,
+	mt.MATBF AS Stock_Material,
+	CASE WHEN LEFT(mt.MATBF, 3) = 'RTN' THEN 'Bad' ELSE 'Good' END AS Material_Status,
+	CASE WHEN LEFT(mt.MATBF, 3) = 'RTN' THEN SUBSTRING(mt.MATBF, 5, LENGTH(mt.MATBF) - 4) ELSE mt.MATBF END AS Original_Sku,
+	CASE WHEN mt.SHKZG = 'H' THEN mt.DMBTR * -1 ELSE mt.DMBTR END AS Inventory_Financial_Amount,
+	CAST(mt.STOCK_QTY AS INT) AS Inventory_Quantity,
+	mt.STOCK_VALUE_A1 AS Inventory_Transactional_Amount,
+	ifnull(msr.RMA_FLAG, 0) AS RMA_to_Lindon_Count,
+	CASE WHEN LEFT(mt.SGTXT, 4) = 'PAID' THEN 1 ELSE 0 END AS Paid_Count,
+	ROW_NUMBER() OVER (PARTITION BY mt.MBLNR, mt.ZEILE, ifnull(mt.LGORT_SID, mt.werks) ORDER BY mt.Record_Type) AS RN,
+	CASE WHEN LEFT(mt.SGTXT, 1) = 'a' THEN mt.sgtxt WHEN s2c.deployedrecordid IS NOT NULL THEN s2c.deployedrecordid ELSE NULL END as Inventory_Deployed_BK,
+	mt.sgtxt AS Inventory_Movement_Text,
+	msr.in_transit,
+	msr.same_day_transfer,
+	ifnull(rev.Is_Reversal, 0) as Is_Reversal,
+	ifnull(rev.Has_Reversal, 0) AS Has_Reversal,
+	rev.Initial_Material_Document,
+	rev.Initial_Material_Document_Item,
+	rev.Initial_Movement_Type,
+	rev.Reversal_Material_Document,
+	rev.Reversal_Material_Document_Item,
+	rev.Reversal_Movement_Type,
+	CASE WHEN s2c.Delivery_Deleted IS NOT NULL THEN s2c.DELIVERY_deleted WHEN d601.Work_Order_Name IS NOT NULL THEN 1 END AS Delivery_Deleted,
+	d601.Work_Order_ID_BK,
+	d601.Work_Order_Name
+FROM SOURCE_SAP_INTERNAL.matdoc mt
+	LEFT JOIN Dim.Movement_type mvmt ON MVMT.movement = mt.BWART
+	LEFT JOIN DIM.Inventory_Transfer_Details msr ON MSR.PLANT = mt.WERKS AND MSR.STORAGE_LOCATION = mt.LGORT_SID AND MSR.MATERIAL_DOCUMENT = mt.MBLNR AND msr.MATERIAL_DOCUMENT_LINE_ITEM = mt.ZEILE
+		AND msr.MOVEMENT_TYPE = mt.BWART
+	LEFT JOIN staging.SAP_Reversals rev ON rev.matdoc = mt.MBLNR AND rev.matdocitem = mt.zeile
+	LEFT JOIN staging.SAP_ShipToCustomer s2c ON s2c.materialdoc = mt.MBLNR AND s2c.materialdocitem = mt.ZEILE 
+	LEFT JOIN TEMP.InventoryMovementStage_601 d601 ON d601.aufnr = mt.AUFNR AND d601.rn = 1
+WHERE mandt = 300 AND LBBSA_SID <> 06  and mt.bwart not in ('107', '109')
+--AND (mt.WERKS <> 1000 OR (mt.WERKS = '1000' AND mvmt.MovementTypeDesc <> 'Ship to Customer'))
+--	AND werks LIKE '7%' AND LGORT_SID IS null
