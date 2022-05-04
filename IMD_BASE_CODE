@@ -8,6 +8,8 @@ FROM (select distinct AUFNR, VBELN as Sales_Document from SOURCE_SAP_INTERNAL.VB
 	left join SOURCE_SAP_INTERNAL.VBAK on VBAK.VBELN = VBAP.Sales_Document
 	LEFT JOIN prod.SOURCE_SFDC_PROD_INTERNAL.WORK_ORDER__C wo ON wo.NAME = vbak.bname;
 
+
+
 CREATE OR REPLACE TABLE staging.SAP_ShipToCustomer AS 
 SELECT
 	matdoc.mblnr AS MaterialDoc,
